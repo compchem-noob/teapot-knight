@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>壶中天地 · Teapot Knight（网页原型）</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#05080a;overflow:hidden}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{background:#000;box-shadow:0 0 60px #000}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="960" height="540"></canvas></div>
+<script>
+'use strict';
+/* =====================================================================
+ *  壶中天地 · Teapot Knight —— 横版动作冒险原型
+ *  主角是茶壶头骑士：茶壶里装的东西决定能力，背包里带的瓶子决定负重。
+ *
+ *  想细化填充物？只改下面的 FILLINGS 即可：
+ *    weight  重量（影响灵活度、能否通过脆木桥）
+ *    run / jump / grav  对跑速、跳跃、重力的倍率
+ *    dmg  近战伤害      melee  近战附加效果：'push' 击退 / 'slow' 减速
+ *    ability  特殊能力：'doubleJump' 二段跳 / 'glide' 滑翔 / 'wallCling' 黏墙 / 'slam' 重砸
+ *    shot  喷射：dmg 伤害, speed 速度, cost 消耗, grav 弹道重力, life 存在时间, size 大小,
+ *                effect 'push' 击退 / 'slow' 减速 / 'break' 能打碎裂纹石块
+ * ===================================================================== */
+const FILLINGS = {
+  none:  { name:'空壶', color:'#c9d4d8', weight:0,   run:1.00, jump:1.00, grav:1.00, dmg:1, melee:null,
+           ability:null, abilityDesc:'没有特殊能力。最轻，但只能用壶身敲打。', shot:null },
+  water: { name:'清水', color:'#5fb8ff', weight:1.0, run:1.00, jump:1.00, grav:1.00, dmg:1, melee:null,
+           ability:'doubleJump', abilityDesc:'二段跳：空中再按一次跳跃（消耗 6）。',
+           shot:{ name:'水弹', dmg:1, speed:560, cost:10, grav:0, life:0.9, size:7, effect:null } },
+  steam: { name:'蒸汽', color:'#e9f1f4', weight:0.5, run:1.05, jump:1.12, grav:0.85, dmg:1, melee:'push',
+           ability:'glide', abilityDesc:'滑翔：下落时按住跳跃缓慢飘落，在上升气流里能爬升（每秒消耗 7）。',
+           shot:{ name:'蒸汽喷吐', dmg:1, speed:380, cost:8, grav:-200, life:0.32, size:16, effect:'push' } },
+  honey: { name:'蜂蜜', color:'#f2a91e', weight:1.5, run:0.90, jump:0.95, grav:1.00, dmg:1, melee:'slow',
+           ability:'wallCling', abilityDesc:'黏墙：空中贴墙会黏住，按跳跃蹬墙（黏住每秒消耗 4，蹬墙 3）。攻击会减速敌人。',
+           shot:{ name:'蜜团', dmg:1, speed:430, cost:12, grav:900, life:1.2, size:9, effect:'slow' } },
+  iron:  { name:'铁砂', color:'#8d939c', weight:3.0, run:0.88, jump:0.86, grav:1.10, dmg:2, melee:null,
+           ability:'slam', abilityDesc:'重砸：空中按 ↓+攻击 急坠，落地震碎裂纹石块（消耗 12）。攻击能打碎裂纹石块，几乎不被击退。',
+           shot:{ name:'铁砂弹', dmg:2, speed:520, cost:15, grav:1200, life:1.4, size:8, effect:'break' } },
+};
+const ABILITY_NAME = { doubleJump:'二段跳', glide:'滑翔', wallCling:'黏墙', slam:'重砸' };
+const WEIGHT = {
+  speedPerKg: 0.065,   // 每 1 单位重量降低的跑速比例
+  jumpPerKg:  0.03,    // 每 1 单位重量降低的跳跃力比例
+  minSpeed: 0.5, minJump: 0.7,
+  fragileLimit: 2.0,   // 脆木桥承重上限
+};
+const PHYS = { gravity:2000, run:270, accel:2600, jumpV:700, doubleJumpV:640, maxFall:900,
+  dashV:640, dashTime:0.16, dashCD:0.55, glideFall:85, wallSlide:55, wallJumpVX:360, wallJumpVY:650, pogoV:560 };
+const BACKPACK = { startSlots:3, maxSlots:5, upgradeCost:8 };
+const PLAYER_HP = 5;
+
+/* ============================== 基础工具 ============================== */
+const cvs = document.getElementById('c'), ctx = cvs.getContext('2d');
+const VW = 960, VH = 540, T = 32, STEP = 1/120;
+const FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
+const clamp = (v,a,b) => v<a?a:v>b?b:v;
+const overlap = (a,b) => a.x<b.x+b.w && a.x+a.w>b.x && a.y<b.y+b.h && a.y+a.h>b.y;
+function hash(x,y){ let h=(x*374761393 + y*668265263) ^ 0x5bd1e995; h=Math.imul(h^(h>>>13),1274126177); return ((h^(h>>>16))>>>0)/4294967296; }
+function hexToRgb(h){ const n=parseInt(h.slice(1),16); return [n>>16&255,n>>8&255,n&255]; }
+function lerpColor(a,b,t){ const A=hexToRgb(a),B=hexToRgb(b); return `rgb(${A.map((v,i)=>Math.round(v+(B[i]-v)*t)).join(',')})`; }
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+/* ============================== 地图 ==============================
+ * 地块：'#' 岩石  '=' 单向木台  '^' 荆棘  'C' 裂纹石块  'F' 脆木桥
+ * 路线：苔原（清水·二段跳）→ 荆棘深谷（蒸汽·滑翔）→ 蜜蜡竖井（蜂蜜·黏墙）
+ *      → 脆木桥（控制负重）→ 铁砂回廊（铁砂·重砸）→ 金茶盏 */
+const MW = 150, MH = 40;
+const map = [], updraft = [];
+for (let y=0;y<MH;y++){ map.push(new Array(MW).fill('.')); updraft.push(new Array(MW).fill(0)); }
+function fill(x0,y0,x1,y1,c){ for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++) map[y][x]=c; }
+function zone(x0,y0,x1,y1){ for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++) updraft[y][x]=1; }
+
+function buildLevel(){
+  for (const r of map) r.fill('.'); for (const r of updraft) r.fill(0);
+  fill(0,0,MW-1,0,'#'); fill(0,MH-1,MW-1,MH-1,'#'); fill(0,0,0,MH-1,'#'); fill(MW-1,0,MW-1,MH-1,'#');
+  for (let x=1;x<=77;x++) fill(x,1,x,3+Math.floor(hash(x,7)*3),'#');      // 洞顶
+  // A 苔原
+  fill(1,36,39,38,'#');
+  fill(15,32,18,32,'='); fill(21,29,24,29,'=');
+  fill(30,31,33,35,'#');                                                // 高墙：需要二段跳
+  // B 荆棘深谷
+  fill(40,38,64,38,'#'); fill(40,37,64,37,'^');
+  zone(50,17,53,36);                                                     // 上升气流
+  // C 蜜蜡竖井
+  fill(65,36,83,38,'#');
+  fill(78,8,78,33,'#'); fill(83,8,83,35,'#'); fill(78,1,83,2,'#');
+  // D 回廊与脆木桥
+  fill(84,12,113,38,'#');
+  fill(84,1,148,3,'#'); fill(84,10,148,11,'#');
+  fill(96,10,108,11,'.'); fill(96,10,108,10,'F'); fill(96,12,108,15,'.'); fill(96,15,108,15,'^');
+  fill(124,10,127,11,'C');                                               // 裂纹石板
+  // E 金茶盏密室
+  fill(114,36,148,38,'#'); fill(138,35,142,35,'#');
+  fill(117,31,120,31,'='); fill(126,27,130,27,'=');
+}
+
+const LEVEL_OBJECTS = [
+  { type:'start', tx:3, floor:36 },
+  { type:'bench', tx:6, floor:36 },
+  { type:'sign', tx:9, floor:36, text:'←/→ 移动　空格 跳跃　J 攻击（配合 ↑/↓）\nL 冲刺　I 喷射（消耗茶壶内容物）\nB 打开背包与说明' },
+  { type:'spring', tx:12, floor:36, fill:'water' },
+  { type:'sign', tx:14, floor:36, text:'泉眼：按 E 把茶壶灌满，原来的内容物自动装瓶进背包。\n按 C 只装一瓶放进背包。\n按 1/2/3 与背包里的瓶子互换。' },
+  { type:'leaf', tx:17, ty:31 }, { type:'leaf', tx:23, ty:28 },
+  { type:'crawler', tx:22, floor:36 },
+  { type:'sign', tx:27, floor:36, text:'这堵墙太高了。\n装着清水时，可以在空中再跳一次。' },
+  { type:'spring', tx:36, floor:36, fill:'steam' },
+  { type:'sign', tx:38, floor:36, text:'前方是荆棘深谷。\n装着蒸汽时，下落中按住跳跃可以滑翔；\n谷中的上升气流会把你托起。' },
+  { type:'leaf', tx:52, ty:22 },
+  { type:'bench', tx:67, floor:36 },
+  { type:'spring', tx:71, floor:36, fill:'honey' },
+  { type:'flyer', tx:72, ty:29 },
+  { type:'sign', tx:75, floor:36, text:'竖井高耸入云。\n装着蜂蜜时，空中贴墙会黏住，\n按跳跃蹬向对面的墙。' },
+  { type:'leaf', tx:80, ty:20 },
+  { type:'bench', tx:87, floor:10 },
+  { type:'flyer', tx:91, ty:6 },
+  { type:'sign', tx:94, floor:10, text:'脆木桥：总重超过 2.0 就会坍塌！\n按 Q 选中背包里的瓶子，按 X 倒掉，减轻负重。' },
+  { type:'leaf', tx:102, ty:7 },
+  { type:'spring', tx:111, floor:10, fill:'iron' },
+  { type:'sign', tx:115, floor:10, text:'铁砂很重，但能砸碎裂纹石块。\n空中按 ↓+J 重砸。' },
+  { type:'crawler', tx:119, floor:10 },
+  { type:'crawler', tx:121, floor:36 }, { type:'crawler', tx:133, floor:36 }, { type:'flyer', tx:128, ty:23 },
+  { type:'leaf', tx:128, ty:26 },
+  { type:'goal', tx:140, floor:35 },
+];
+
+/* ============================== 状态 ============================== */
+let state = 'title';           // title / play / pause / win
+let springs=[], benches=[], signs=[], leaves=[], goal=null, enemies=[], projectiles=[], particles=[], toasts=[];
+let camX=0, camY=0, shakeT=0, shakeAmp=1, animT=0, playTime=0, tileCanvas=null;
+const fragile = new Map();
+const P = {};
+
+function resetPlayer(){
+  const s = LEVEL_OBJECTS.find(o=>o.type==='start');
+  Object.assign(P, { x:s.tx*T+5, y:s.floor*T-40, w:22, h:40, vx:0, vy:0, face:1, onGround:false, coyote:0, jumpBuf:0,
+    jumpCut:true, usedDouble:false, airDash:true, dashT:0, dashCD:0, attackT:0, attackCD:0, attackDir:'side',
+    hp:PLAYER_HP, inv:0, gliding:false, clinging:false, clingDir:0, wallGrace:0, wallLock:0, slamming:false, dropT:0,
+    teapot:{type:'none',level:0}, slots:new Array(BACKPACK.startSlots).fill(null), sel:0, leaves:0, deaths:0,
+    bench:null, safe:{x:s.tx*T+5,y:s.floor*T-40}, dying:0, fade:0, fxT:0 });
+}
+
+function spawnEnemies(){
+  enemies = [];
+  for (const o of LEVEL_OBJECTS){
+    if (o.type==='crawler') enemies.push({ kind:'crawler', x:o.tx*T, y:o.floor*T-20, w:30, h:20, vx:0, vy:0, dir:-1, speed:60, hp:4, alive:true, flash:0, slow:0, kT:0, kvx:0, onGround:false });
+    if (o.type==='flyer') enemies.push({ kind:'flyer', x:o.tx*T, y:o.ty*T, w:26, h:22, vx:0, vy:0, hx:o.tx*T, hy:o.ty*T, t:Math.random()*6, hp:3, alive:true, flash:0, slow:0, kT:0, kvx:0 });
+  }
+}
+
+function newGame(){
+  buildLevel(); fragile.clear(); buildTileCanvas();
+  springs=[]; benches=[]; signs=[]; leaves=[]; projectiles=[]; particles=[]; toasts=[];
+  for (const o of LEVEL_OBJECTS){
+    if (o.type==='spring') springs.push({ x:o.tx*T+T/2, y:o.floor*T, fill:o.fill });
+    if (o.type==='bench')  benches.push({ x:o.tx*T+T/2, y:o.floor*T });
+    if (o.type==='sign')   signs.push({ x:o.tx*T+T/2, y:o.floor*T, text:o.text });
+    if (o.type==='leaf')   leaves.push({ x:o.tx*T+T/2, y:o.ty*T+T/2, bx:o.tx*T+T/2, by:o.ty*T+T/2, taken:false, drop:false });
+    if (o.type==='goal')   goal = { x:o.tx*T+T/2, y:o.floor*T };
+  }
+  resetPlayer(); P.bench = benches[0]; spawnEnemies();
+  playTime = 0;
+  camX = clamp(P.x-VW/2,0,MW*T-VW); camY = clamp(P.y-VH/2,0,MH*T-VH);
+}
+
+/* ============================== 地块与碰撞 ============================== */
+const SOLID = { '#':1, 'C':1, 'F':1 };
+function tile(tx,ty){
+  if (tx<0||ty<0||tx>=MW||ty>=MH) return '#';
+  const c = map[ty][tx];
+  if (c==='F'){ const s=fragile.get(ty*MW+tx); if (s && s.gone) return '.'; }
+  return c;
+}
+const solidAt = (tx,ty) => !!SOLID[tile(tx,ty)];
+
+function moveX(b,dx){
+  if (!dx) return 0;
+  b.x += dx;
+  const y0=Math.floor(b.y/T), y1=Math.floor((b.y+b.h-0.01)/T);
+  if (dx>0){ const tx=Math.floor((b.x+b.w-0.01)/T); for(let ty=y0;ty<=y1;ty++) if(solidAt(tx,ty)){ b.x=tx*T-b.w; return 1; } }
+  else     { const tx=Math.floor(b.x/T);            for(let ty=y0;ty<=y1;ty++) if(solidAt(tx,ty)){ b.x=(tx+1)*T;  return -1; } }
+  return 0;
+}
+function moveY(b,dy,ignoreOneWay){
+  if (!dy) return 0;
+  const prevBottom = b.y+b.h;
+  b.y += dy;
+  const x0=Math.floor(b.x/T), x1=Math.floor((b.x+b.w-0.01)/T);
+  if (dy>0){
+    const ty=Math.floor((b.y+b.h-0.01)/T);
+    for (let tx=x0;tx<=x1;tx++){ const c=tile(tx,ty); if (SOLID[c] || (c==='=' && !ignoreOneWay && prevBottom<=ty*T+0.01)){ b.y=ty*T-b.h; return 1; } }
+  } else {
+    const ty=Math.floor(b.y/T);
+    for (let tx=x0;tx<=x1;tx++) if (solidAt(tx,ty)){ b.y=(ty+1)*T; return -1; }
+  }
+  return 0;
+}
+function touchingWall(d){
+  const tx = d>0 ? Math.floor((P.x+P.w+1)/T) : Math.floor((P.x-1)/T);
+  const y0=Math.floor((P.y+4)/T), y1=Math.floor((P.y+P.h-6)/T);
+  for (let ty=y0;ty<=y1;ty++) if (solidAt(tx,ty)) return true;
+  return false;
+}
+function feetTiles(){
+  const ty=Math.floor((P.y+P.h+1)/T), out=[];
+  for (let tx=Math.floor(P.x/T); tx<=Math.floor((P.x+P.w-0.01)/T); tx++) out.push([tx,ty]);
+  return out;
+}
+function inSpikes(){
+  const r={ x:P.x+4, y:P.y+P.h*0.5, w:P.w-8, h:P.h*0.5 };
+  for (let ty=Math.floor(r.y/T); ty<=Math.floor((r.y+r.h)/T); ty++)
+    for (let tx=Math.floor(r.x/T); tx<=Math.floor((r.x+r.w)/T); tx++)
+      if (tile(tx,ty)==='^' && overlap(r,{x:tx*T+3,y:ty*T+T*0.45,w:T-6,h:T*0.55})) return true;
+  return false;
+}
+function breakCracked(tx,ty){
+  const stack=[[tx,ty]]; let n=0;
+  while (stack.length){
+    const [x,y]=stack.pop();
+    if (tile(x,y)!=='C') continue;
+    map[y][x]='.'; n++;
+    for (let i=0;i<6;i++) particles.push({ x:x*T+Math.random()*T, y:y*T+Math.random()*T, vx:(Math.random()-0.5)*300, vy:-Math.random()*300, life:0.9, max:0.9, col:'#5a5f66', size:4+Math.random()*4, g:1400 });
+    stack.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
+  }
+  if (n){ sfx('break'); shake(0.35,1.4); }
+}
+
+/* ============================== 茶壶与背包 ============================== */
+const fdef = () => FILLINGS[P.teapot.type] || FILLINGS.none;
+function totalWeight(){
+  let w = FILLINGS[P.teapot.type].weight * P.teapot.level/100;
+  for (const s of P.slots) if (s) w += FILLINGS[s.type].weight * s.level/100;
+  return w;
+}
+const agility = () => clamp(1-WEIGHT.speedPerKg*totalWeight(), WEIGHT.minSpeed, 2);
+const speedMul = () => agility() * fdef().run;
+const jumpMul  = () => clamp(1-WEIGHT.jumpPerKg*totalWeight(), WEIGHT.minJump, 2) * fdef().jump;
+
+function emptyTeapot(){ toast(`${fdef().name}用完了，茶壶空了`); P.teapot={type:'none',level:0}; }
+function useFill(n){
+  if (P.teapot.type==='none' || P.teapot.level < n-0.001) return false;
+  P.teapot.level -= n; if (P.teapot.level<=0.01) emptyTeapot();
+  return true;
+}
+function drainFill(rate,dt){
+  if (P.teapot.type==='none') return false;
+  P.teapot.level -= rate*dt; if (P.teapot.level<=0){ emptyTeapot(); return false; }
+  return true;
+}
+function stashTeapot(){   // 把茶壶里剩下的东西装瓶放进背包
+  if (P.teapot.type==='none' || P.teapot.level<1) return true;
+  const i = P.slots.indexOf(null);
+  if (i<0){ toast(`背包满了，原来的${fdef().name}被倒掉了`); return false; }
+  P.slots[i] = { ...P.teapot }; return true;
+}
+function pourSpring(s){
+  const name = FILLINGS[s.fill].name;
+  if (P.teapot.type===s.fill){ P.teapot.level=100; toast(`${name}已灌满`); }
+  else { stashTeapot(); P.teapot={ type:s.fill, level:100 }; toast(`茶壶里装上了${name}：${ABILITY_NAME[FILLINGS[s.fill].ability]||''}`); }
+  sfx('pour'); splashAt(s.x, s.y-20, FILLINGS[s.fill].color, 14);
+}
+function bottleSpring(s){
+  const i = P.slots.indexOf(null);
+  if (i<0){ toast('背包满了（按 Q 选中，X 倒掉）'); return; }
+  P.slots[i] = { type:s.fill, level:100 }; toast(`装了一瓶${FILLINGS[s.fill].name}放进背包`); sfx('pickup');
+}
+function swapSlot(i){
+  if (i>=P.slots.length) return;
+  const s = P.slots[i];
+  const cur = (P.teapot.type!=='none' && P.teapot.level>=1) ? { ...P.teapot } : null;
+  if (!s && !cur){ toast('这一格是空的'); return; }
+  P.teapot = s ? { ...s } : { type:'none', level:0 };
+  P.slots[i] = cur; P.sel = i;
+  toast(`茶壶：${fdef().name}`); sfx('pour');
+  splashAt(P.x+P.w/2, P.y+6, fdef().color, 8);
+}
+function discardSlot(i){
+  const s = P.slots[i];
+  if (!s){ toast(`第 ${i+1} 格是空的`); return; }
+  P.slots[i] = null; toast(`倒掉了一瓶${FILLINGS[s.type].name}`); sfx('pour');
+  splashAt(P.x+P.w/2, P.y+P.h-6, FILLINGS[s.type].color, 10);
+}
+function rest(b){
+  P.hp = PLAYER_HP; P.bench = b; P.vx = 0; fragile.clear(); spawnEnemies();
+  toast('在茶台小憩，生命已恢复'); sfx('rest');
+}
+function upgradeBackpack(){
+  if (P.slots.length>=BACKPACK.maxSlots){ toast('背包已经是最大了'); return; }
+  if (P.leaves<BACKPACK.upgradeCost){ toast(`扩充背包需要 ${BACKPACK.upgradeCost} 片茶叶`); return; }
+  P.leaves -= BACKPACK.upgradeCost; P.slots.push(null); toast(`背包扩充到 ${P.slots.length} 格`); sfx('rest');
+}
+function nearInteractable(){
+  const cx=P.x+P.w/2, by=P.y+P.h;
+  for (const s of springs) if (Math.abs(s.x-cx)<38 && Math.abs(s.y-by)<40) return { kind:'spring', o:s };
+  for (const b of benches) if (Math.abs(b.x-cx)<40 && Math.abs(b.y-by)<40) return { kind:'bench', o:b };
+  return null;
+}
+
+/* ============================== 输入 ============================== */
+const KEYMAP = { ArrowLeft:'left', KeyA:'left', ArrowRight:'right', KeyD:'right', ArrowUp:'up', KeyW:'up', ArrowDown:'down', KeyS:'down',
+  Space:'jump', KeyK:'jump', KeyJ:'attack', KeyL:'dash', ShiftLeft:'dash', ShiftRight:'dash', KeyI:'shoot', KeyF:'shoot',
+  KeyE:'interact', KeyC:'bottle', KeyQ:'select', KeyX:'discard', KeyU:'upgrade', KeyB:'pause', Tab:'pause', Escape:'pause',
+  KeyM:'mute', KeyR:'restart', Enter:'enter', Digit1:'slot0', Digit2:'slot1', Digit3:'slot2', Digit4:'slot3', Digit5:'slot4' };
+const held = {}, pressed = new Set();
+const consume = a => pressed.delete(a);
+addEventListener('keydown', e => {
+  const a = KEYMAP[e.code]; if (!a) return;
+  e.preventDefault(); held[a] = true;
+  if (e.repeat) return;
+  if (a==='mute'){ muted=!muted; toast(muted?'已静音':'声音已开启'); return; }
+  if (state==='title'){ if (a==='enter'||a==='jump'){ state='play'; sfx('rest'); } return; }
+  if (state==='win'){ if (a==='restart'||a==='enter'){ newGame(); state='play'; } return; }
+  if (a==='pause'){ state = state==='pause' ? 'play' : 'pause'; return; }
+  if (state==='pause'){ if (a==='restart'){ newGame(); state='play'; } return; }
+  pressed.add(a);
+});
+addEventListener('keyup', e => { const a=KEYMAP[e.code]; if (a) held[a]=false; });
+addEventListener('blur', () => { for (const k in held) held[k]=false; });
+
+/* ============================== 音效 ============================== */
+let actx=null, muted=false;
+const SFX = { jump:[380,560,0.09,'square',0.035], dbl:[520,880,0.12,'triangle',0.05], dash:[300,150,0.12,'sawtooth',0.03],
+  swing:[700,350,0.07,'triangle',0.03], hit:[260,90,0.12,'sawtooth',0.06], hurt:[180,60,0.25,'square',0.07],
+  pickup:[880,1400,0.12,'sine',0.06], pour:[340,220,0.2,'triangle',0.05], break:[140,40,0.35,'sawtooth',0.08],
+  shoot:[620,300,0.1,'square',0.03], rest:[440,660,0.3,'sine',0.06], clink:[1400,1100,0.06,'square',0.03],
+  die:[220,40,0.8,'sawtooth',0.07], land:[120,80,0.05,'sine',0.04], slam:[90,40,0.3,'square',0.08], crack:[200,120,0.2,'sawtooth',0.05] };
+function sfx(n){
+  if (muted || !SFX[n]) return;
+  try { actx = actx || new (window.AudioContext||window.webkitAudioContext)(); } catch(e){ return; }
+  const [f0,f1,d,type,vol]=SFX[n], t=actx.currentTime, o=actx.createOscillator(), g=actx.createGain();
+  o.type=type; o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(f1,t+d);
+  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.0001,t+d);
+  o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t+d+0.02);
+}
+
+/* ============================== 特效 ============================== */
+function toast(text){ toasts.push({ text, t:2.6 }); if (toasts.length>3) toasts.shift(); }
+function shake(t,a){ shakeT=Math.max(shakeT,t); shakeAmp=a||1; }
+function splashAt(x,y,col,n){
+  for (let i=0;i<n;i++) particles.push({ x, y, vx:(Math.random()-0.5)*260, vy:-Math.random()*260, life:0.6, max:0.6, col, size:2+Math.random()*3, g:900 });
+}
+function updateParticles(dt){
+  for (const p of particles){ p.life-=dt; p.vy+=(p.g||0)*dt; p.x+=p.vx*dt; p.y+=p.vy*dt; }
+  particles = particles.filter(p=>p.life>0);
+  for (const t of toasts) t.t-=dt;
+  toasts = toasts.filter(t=>t.t>0);
+}
+
+/* ============================== 主角逻辑 ============================== */
+function update(dt){
+  animT += dt;
+  if (P.dying>0){
+    P.dying -= dt; if (P.dying<=0) respawnAtBench();
+    updateParticles(dt); updateCamera(dt); return;
+  }
+  playTime += dt;
+  if (P.fade>0) P.fade -= dt;
+  handleActions();
+  updatePlayer(dt);
+  updateEnemies(dt);
+  updateProjectiles(dt);
+  updatePickups(dt);
+  updateFragile(dt);
+  updateParticles(dt);
+  updateCamera(dt);
+  if (shakeT>0) shakeT -= dt;
+}
+
+function handleActions(){
+  const near = nearInteractable();
+  if (consume('interact')){
+    if (near && near.kind==='spring') pourSpring(near.o);
+    else if (near && near.kind==='bench') rest(near.o);
+  }
+  if (consume('up') && near && near.kind==='bench' && P.onGround) rest(near.o);
+  if (consume('bottle')){ if (near && near.kind==='spring') bottleSpring(near.o); else toast('要站在泉眼旁才能装瓶'); }
+  for (let i=0;i<5;i++) if (consume('slot'+i)) swapSlot(i);
+  if (consume('select')){ P.sel=(P.sel+1)%P.slots.length; sfx('clink'); }
+  if (consume('discard')) discardSlot(P.sel);
+  if (consume('upgrade')){ if (near && near.kind==='bench') upgradeBackpack(); else toast('在茶台旁才能扩充背包'); }
+}
+
+function updatePlayer(dt){
+  const def=fdef(), ab=def.ability, sm=speedMul(), jm=jumpMul(), g=PHYS.gravity*def.grav;
+  for (const k of ['inv','jumpBuf','dashCD','attackCD','attackT','wallLock','wallGrace','dropT','coyote']) P[k]=Math.max(0,P[k]-dt);
+  const dir = (held.right?1:0) - (held.left?1:0);
+  if (consume('jump')) P.jumpBuf = 0.12;
+
+  // ↓ + 跳跃：从单向木台落下
+  if (held.down && P.jumpBuf>0 && P.onGround && feetTiles().every(([x,y])=>tile(x,y)!=='#' && tile(x,y)!=='C' && tile(x,y)!=='F')){
+    P.dropT=0.25; P.jumpBuf=0; P.onGround=false; P.y+=2;
+  }
+  // 冲刺
+  if (consume('dash') && P.dashCD<=0 && (P.onGround||P.airDash) && !P.slamming){
+    P.dashT=PHYS.dashTime; P.dashCD=PHYS.dashCD; if (!P.onGround) P.airDash=false; if (dir) P.face=dir; sfx('dash');
+  }
+  // 水平移动
+  if (P.dashT>0){
+    P.dashT-=dt; P.vx=P.face*PHYS.dashV*Math.max(0.75,sm); P.vy=0;
+    particles.push({ x:P.x+P.w/2, y:P.y+P.h/2, vx:0, vy:0, life:0.18, max:0.18, col:def.color, size:10, g:0 });
+  } else if (P.slamming){ P.vx=0; }
+  else if (P.wallLock<=0){
+    const target=dir*PHYS.run*sm, a=(P.onGround?PHYS.accel:PHYS.accel*0.7)*dt;
+    if (P.vx<target) P.vx=Math.min(target,P.vx+a); else if (P.vx>target) P.vx=Math.max(target,P.vx-a);
+    if (dir) P.face=dir;
+  }
+  // 黏墙（蜂蜜）
+  P.clinging=false;
+  if (ab==='wallCling' && !P.onGround && P.dashT<=0 && !P.slamming){
+    for (const d of [-1,1]){
+      if (touchingWall(d) && P.vy>-60 && (dir===d || P.clingDir===d) && dir!==-d){
+        if (drainFill(4,dt)){ P.clinging=true; P.clingDir=d; P.wallGrace=0.12; P.face=-d;
+          if (Math.random()<dt*6) particles.push({ x:P.x+(d>0?P.w:0), y:P.y+P.h*0.6, vx:0, vy:40, life:0.8, max:0.8, col:def.color, size:3, g:300 }); }
+        break;
+      }
+    }
+  }
+  if (!P.clinging && P.wallGrace<=0) P.clingDir=0;
+  // 跳跃
+  if (P.jumpBuf>0){
+    if (P.onGround || P.coyote>0){
+      P.vy=-PHYS.jumpV*jm; P.onGround=false; P.coyote=0; P.jumpBuf=0; P.jumpCut=false; sfx('jump');
+      splashAt(P.x+P.w/2, P.y+P.h, 'rgba(200,220,210,0.7)', 5);
+    } else if (ab==='wallCling' && P.clingDir && (P.clinging||P.wallGrace>0) && useFill(3)){
+      P.vx=-P.clingDir*PHYS.wallJumpVX*Math.max(0.7,sm); P.vy=-PHYS.wallJumpVY*jm; P.wallLock=0.17;
+      P.face=-P.clingDir; P.clingDir=0; P.wallGrace=0; P.clinging=false; P.jumpBuf=0; P.jumpCut=false; sfx('jump');
+    } else if (ab==='doubleJump' && !P.usedDouble && !P.slamming && useFill(6)){
+      P.vy=-PHYS.doubleJumpV*jm; P.usedDouble=true; P.jumpBuf=0; P.jumpCut=false; sfx('dbl');
+      for (let i=0;i<10;i++){ const a=i/10*Math.PI*2; particles.push({ x:P.x+P.w/2, y:P.y+P.h, vx:Math.cos(a)*160, vy:Math.sin(a)*60, life:0.35, max:0.35, col:def.color, size:3, g:0 }); }
+    }
+  }
+  if (!held.jump && P.vy<0 && !P.jumpCut){ P.vy*=0.5; P.jumpCut=true; }
+  // 重力、滑翔、上升气流
+  P.gliding=false;
+  if (P.dashT<=0){
+    if (P.slamming) P.vy=1150;
+    else {
+      P.vy += g*dt;
+      if (P.clinging) P.vy=Math.min(P.vy,PHYS.wallSlide);
+      const ux=Math.floor((P.x+P.w/2)/T), uy=Math.floor((P.y+P.h/2)/T), inUp=!!(updraft[uy]&&updraft[uy][ux]);
+      if (ab==='glide' && !P.onGround && held.jump && (P.vy>0||inUp) && drainFill(7,dt)){
+        P.gliding=true; P.vy=Math.min(P.vy,PHYS.glideFall);
+        P.fxT-=dt; if (P.fxT<=0){ P.fxT=0.05; particles.push({ x:P.x+P.w/2+(Math.random()-0.5)*16, y:P.y-8, vx:(Math.random()-0.5)*30, vy:-60, life:0.7, max:0.7, col:'rgba(235,242,245,0.55)', size:6+Math.random()*5, g:0 }); }
+      }
+      if (inUp) P.vy = P.gliding ? Math.max(P.vy-3200*dt,-340) : P.vy-1100*dt;
+      P.vy=Math.min(P.vy,PHYS.maxFall);
+    }
+  }
+  // 移动与碰撞
+  const wasGround=P.onGround;
+  if (moveX(P,P.vx*dt) && P.dashT>0) P.dashT=0;
+  const hy=moveY(P,P.vy*dt,P.dropT>0);
+  P.onGround=false;
+  if (hy===1){
+    if (!wasGround){
+      if (P.slamming) doSlam();
+      else if (P.vy>450){ sfx('land'); splashAt(P.x+P.w/2,P.y+P.h,'rgba(200,220,210,0.6)',4); }
+    }
+    P.vy=0; P.onGround=true; P.usedDouble=false; P.airDash=true; P.jumpCut=true; P.coyote=0.1;
+  } else if (hy===-1) P.vy=Math.max(P.vy,0);
+  // 先判定荆棘，再记录安全落脚点（掉进荆棘后回到这里；脚边一格内有荆棘的位置不算安全）
+  if (inSpikes()) return hazardHit();
+  if (P.onGround && feetTiles().every(([x,y])=>(tile(x,y)==='#'||tile(x,y)==='=') && tile(x,y-1)!=='^' && tile(x-1,y-1)!=='^' && tile(x+1,y-1)!=='^'))
+    { P.safe.x=P.x; P.safe.y=P.y; }
+  // 攻击 / 重砸
+  if (consume('attack') && P.attackCD<=0 && P.dashT<=0){
+    if (held.down && !P.onGround && ab==='slam'){
+      if (useFill(12)){ P.slamming=true; P.vx=0; P.attackCD=0.3; sfx('dash'); } else toast('铁砂不够了');
+    } else doAttack(held.up ? 'up' : (held.down && !P.onGround ? 'down' : 'side'));
+  }
+  if (P.slamming){
+    for (const e of enemies) if (e.alive && overlap(P,e)) damageEnemy(e,2,Math.sign(e.x-P.x)||1,null);
+    particles.push({ x:P.x+P.w/2, y:P.y, vx:0, vy:-80, life:0.25, max:0.25, col:'#8d939c', size:8, g:0 });
+  }
+  // 喷射
+  if (consume('shoot')){
+    const s=def.shot;
+    if (!s) toast('茶壶里没有可以喷射的东西');
+    else if (useFill(s.cost)){
+      projectiles.push({ x:P.x+P.w/2+P.face*20, y:P.y+10, vx:P.face*s.speed, vy:s.grav>0?-180:0, grav:s.grav, life:s.life, max:s.life,
+        dmg:s.dmg, size:s.size, effect:s.effect, col:def.color, hit:new Set() });
+      P.vx -= P.face*60; sfx('shoot');
+    } else toast(`${def.name}不够喷射了`);
+  }
+  // 接触伤害
+  if (P.inv<=0){
+    const hb={ x:P.x+3, y:P.y+6, w:P.w-6, h:P.h-8 };
+    for (const e of enemies) if (e.alive && overlap(hb,e)){ hurt(1, e.x+e.w/2); break; }
+  }
+}
+
+function attackBox(d){
+  if (d==='up')   return { x:P.x-14, y:P.y-54, w:P.w+28, h:58 };
+  if (d==='down') return { x:P.x-14, y:P.y+P.h-4, w:P.w+28, h:56 };
+  return P.face>0 ? { x:P.x+P.w-4, y:P.y+2, w:62, h:34 } : { x:P.x-58, y:P.y+2, w:62, h:34 };
+}
+function doAttack(d){
+  const def=fdef(); P.attackT=0.2; P.attackDir=d; P.attackCD=0.34; sfx('swing');
+  const box=attackBox(d); let pogo=false, hitAny=false, clinked=false;
+  for (const e of enemies) if (e.alive && overlap(box,e)){
+    damageEnemy(e, def.dmg, d==='side'?P.face:(Math.sign(e.x-P.x)||P.face), def.melee); hitAny=true; if (d==='down') pogo=true;
+  }
+  for (let ty=Math.floor(box.y/T); ty<=Math.floor((box.y+box.h)/T); ty++)
+    for (let tx=Math.floor(box.x/T); tx<=Math.floor((box.x+box.w)/T); tx++){
+      const c=tile(tx,ty);
+      if (c==='C'){
+        if (P.teapot.type==='iron'){ breakCracked(tx,ty); hitAny=true; }
+        else if (!clinked){ clinked=true; sfx('clink'); toast('太轻了，打不碎裂纹石块'); }
+        if (d==='down') pogo=true;
+      }
+      if (c==='^' && d==='down') pogo=true;
+    }
+  if (pogo){ P.vy=-PHYS.pogoV; P.usedDouble=false; P.airDash=true; P.jumpCut=true; }
+  if (hitAny && d==='side') P.vx -= P.face*140;
+}
+function doSlam(){
+  P.slamming=false; sfx('slam'); shake(0.3,1.6);
+  for (const [tx,ty] of feetTiles()) for (let dx=-1;dx<=1;dx++) if (tile(tx+dx,ty)==='C') breakCracked(tx+dx,ty);
+  for (const e of enemies) if (e.alive && Math.abs(e.x+e.w/2-(P.x+P.w/2))<110 && Math.abs(e.y+e.h-(P.y+P.h))<60)
+    damageEnemy(e,2,Math.sign(e.x-P.x)||1,null);
+  for (let i=0;i<16;i++) particles.push({ x:P.x+P.w/2, y:P.y+P.h, vx:(i<8?-1:1)*(80+Math.random()*260), vy:-Math.random()*160, life:0.5, max:0.5, col:'#9aa0a8', size:3+Math.random()*3, g:800 });
+}
+function hurt(dmg,srcX){
+  if (P.inv>0 || P.dying>0) return;
+  P.hp-=dmg; P.inv=1.1; sfx('hurt'); shake(0.25,1.2);
+  const d=Math.sign(P.x+P.w/2-srcX)||1, kb=fdef().ability==='slam'?140:330;
+  P.vx=d*kb; P.vy=-360; P.wallLock=0.2; P.slamming=false; P.dashT=0; P.jumpCut=true;
+  if (P.hp<=0) die();
+}
+function hazardHit(){
+  P.hp-=1; sfx('hurt'); shake(0.25,1.2);
+  if (P.hp<=0){ die(); return; }
+  P.x=P.safe.x; P.y=P.safe.y; P.vx=P.vy=0; P.inv=1.0; P.fade=0.35; P.slamming=false; P.dashT=0;
+  fragile.clear();
+}
+function die(){
+  P.dying=1.3; P.deaths++; sfx('die'); P.slamming=false;
+  for (let i=0;i<30;i++) particles.push({ x:P.x+P.w/2, y:P.y+P.h/2, vx:(Math.random()-0.5)*420, vy:(Math.random()-0.5)*420, life:1.1, max:1.1, col:i%2?'#eef3f4':fdef().color, size:3+Math.random()*4, g:300 });
+}
+function respawnAtBench(){
+  const b=P.bench||benches[0];
+  P.hp=PLAYER_HP; P.x=b.x-P.w/2; P.y=b.y-P.h; P.vx=P.vy=0; P.inv=1; P.fade=0.6; P.dying=0;
+  P.safe={ x:P.x, y:P.y }; fragile.clear(); spawnEnemies(); projectiles=[];
+  toast('在茶台边醒来……');
+}
+
+/* ============================== 敌人 ============================== */
+function damageEnemy(e,dmg,kdir,effect){
+  e.hp-=dmg; e.flash=0.12;
+  const kb = effect==='push'?520 : P.teapot.type==='iron'?320 : 220;
+  e.kvx=kdir*kb; e.kT=0.18; if (effect==='slow') e.slow=3;
+  sfx('hit'); splashAt(e.x+e.w/2, e.y+e.h/2, effect==='slow'?'#f2a91e':'#d6f0e0', 6);
+  if (e.hp<=0){
+    e.alive=false; shake(0.12,1);
+    for (let i=0;i<14;i++) particles.push({ x:e.x+e.w/2, y:e.y+e.h/2, vx:(Math.random()-0.5)*320, vy:-Math.random()*320, life:0.8, max:0.8, col:e.kind==='flyer'?'#ffb347':'#4f8a5f', size:3+Math.random()*3, g:900 });
+    const n = 2 + (Math.random()<0.5?1:0);
+    for (let i=0;i<n;i++) leaves.push({ x:e.x+e.w/2, y:e.y+e.h/2, vx:(Math.random()-0.5)*200, vy:-200-Math.random()*150, taken:false, drop:true, delay:0.35 });
+  }
+}
+function updateEnemies(dt){
+  for (const e of enemies){
+    if (!e.alive) continue;
+    e.flash=Math.max(0,e.flash-dt); e.slow=Math.max(0,e.slow-dt); if (e.kT>0) e.kT-=dt;
+    const sp = e.slow>0 ? 0.35 : 1;
+    if (e.kind==='crawler'){
+      e.vy=Math.min(e.vy+PHYS.gravity*dt,PHYS.maxFall);
+      const hx=moveX(e,(e.kT>0?e.kvx:e.dir*e.speed*sp)*dt);
+      const hy=moveY(e,e.vy*dt,false);
+      e.onGround = hy===1; if (hy) e.vy=0;
+      if (e.kT<=0){
+        if (hx) e.dir*=-1;
+        else if (e.onGround){
+          const fx=e.dir>0?e.x+e.w+2:e.x-2, c=tile(Math.floor(fx/T),Math.floor((e.y+e.h+2)/T));
+          if (!SOLID[c] && c!=='=') e.dir*=-1;
+        }
+      }
+    } else {
+      e.t+=dt;
+      const dx=P.x+P.w/2-(e.x+e.w/2), dy=P.y+P.h/2-(e.y+e.h/2), d=Math.hypot(dx,dy)||1;
+      let tvx, tvy;
+      if (d<300 && P.dying<=0){ tvx=dx/d*130*sp; tvy=dy/d*130*sp; }
+      else { tvx=(e.hx-e.x)*1.2; tvy=(e.hy-e.y)*1.2+Math.sin(e.t*2)*40; }
+      e.vx+=(tvx-e.vx)*Math.min(1,dt*3); e.vy+=(tvy-e.vy)*Math.min(1,dt*3);
+      if (e.kT>0) e.vx=e.kvx;
+      if (moveX(e,e.vx*dt)) e.vx*=-0.5;
+      if (moveY(e,e.vy*dt,true)) e.vy*=-0.5;
+    }
+  }
+}
+function updateProjectiles(dt){
+  for (const p of projectiles){
+    p.life-=dt; p.vy+=p.grav*dt; p.x+=p.vx*dt; p.y+=p.vy*dt;
+    if (p.effect==='push') p.size+=dt*40;
+    const tx=Math.floor(p.x/T), ty=Math.floor(p.y/T), c=tile(tx,ty);
+    if (SOLID[c]){
+      if (c==='C' && p.effect==='break') breakCracked(tx,ty);
+      splashAt(p.x,p.y,p.col,6); p.life=0; continue;
+    }
+    for (const e of enemies){
+      if (!e.alive || p.hit.has(e)) continue;
+      if (Math.hypot(p.x-(e.x+e.w/2), p.y-(e.y+e.h/2)) < p.size+e.w/2){
+        damageEnemy(e,p.dmg,Math.sign(p.vx)||1,p.effect); p.hit.add(e);
+        if (p.effect!=='push'){ p.life=0; break; }
+      }
+    }
+  }
+  projectiles = projectiles.filter(p=>p.life>0);
+}
+function updatePickups(dt){
+  const cx=P.x+P.w/2, cy=P.y+P.h/2;
+  for (const l of leaves){
+    if (l.taken) continue;
+    if (l.drop){
+      l.delay-=dt;
+      if (l.delay>0){ l.vy+=900*dt; l.x+=l.vx*dt; l.y+=l.vy*dt; }
+      else { const dx=cx-l.x, dy=cy-l.y, d=Math.hypot(dx,dy)||1; l.x+=dx/d*520*dt; l.y+=dy/d*520*dt; }
+    } else {
+      l.y = l.by + Math.sin(animT*3+l.bx)*4;
+      const d=Math.hypot(cx-l.x, cy-l.y); if (d<80){ l.x+=(cx-l.x)*dt*6; l.y+=(cy-l.y)*dt*6; }
+    }
+    if (Math.hypot(cx-l.x, cy-l.y)<22){ l.taken=true; P.leaves++; sfx('pickup'); }
+  }
+  leaves = leaves.filter(l=>!l.taken || !l.drop);
+  if (goal && overlap(P,{ x:goal.x-18, y:goal.y-46, w:36, h:46 })){ state='win'; sfx('rest'); }
+}
+// 脆木桥：超重时站上去，整座桥的"压力"会累积；超过阈值后，脚下及左右的木板依次断裂
+let bridgeStress = 0;
+function breakPlank(tx,ty){
+  if (!map[ty] || map[ty][tx]!=='F') return;
+  const k=ty*MW+tx, s=fragile.get(k);
+  if (s && s.gone) return;
+  fragile.set(k,{ gone:true, regen:4 }); sfx('crack');
+  for (let i=0;i<8;i++) particles.push({ x:tx*T+Math.random()*T, y:ty*T+4, vx:(Math.random()-0.5)*120, vy:Math.random()*80, life:1, max:1, col:'#8a6a42', size:4+Math.random()*4, g:1200 });
+}
+function updateFragile(dt){
+  const heavy = totalWeight() > WEIGHT.fragileLimit;
+  const onBridge = P.onGround && feetTiles().some(([x,y])=>tile(x,y)==='F');
+  if (onBridge && heavy){
+    if (bridgeStress===0) toast('木桥吱呀作响……太重了！');
+    bridgeStress += dt;
+    if (bridgeStress>0.35) for (const [tx,ty] of feetTiles()) for (let d=-1;d<=1;d++) breakPlank(tx+d,ty);
+  } else if (!onBridge) bridgeStress = Math.max(0, bridgeStress-dt);
+  for (const [k,s] of fragile){
+    if (!s.gone) continue;
+    s.regen-=dt;
+    const tx=k%MW, ty=(k/MW)|0;
+    if (s.regen<=0 && !overlap(P,{ x:tx*T, y:ty*T, w:T, h:T })) fragile.delete(k);
+  }
+}
+function updateCamera(dt){
+  const tx=P.x+P.w/2-VW/2+P.face*60, ty=P.y+P.h/2-VH/2-30;
+  camX+=(tx-camX)*Math.min(1,dt*5); camY+=(ty-camY)*Math.min(1,dt*6);
+  camX=clamp(camX,0,MW*T-VW); camY=clamp(camY,0,MH*T-VH);
+}
+
+/* ============================== 绘制 ============================== */
+const PAL = [
+  { x:0,   top:'#0f2a2e', bot:'#05100f', l:['#14363a','#0f292c','#0a1c1e'], base:'#1b2b2f', moss:'#3f7255' },
+  { x:42,  top:'#1c2b36', bot:'#0a1218', l:['#25394a','#1b2c39','#131f29'], base:'#1f2a33', moss:'#8fa9b5' },
+  { x:66,  top:'#2d220f', bot:'#100b05', l:['#3a2b12','#2b200d','#1e1609'], base:'#2b2418', moss:'#b7862a' },
+  { x:86,  top:'#1d1b26', bot:'#09080d', l:['#2a2735','#211e2a','#17151e'], base:'#23262b', moss:'#6d737c' },
+];
+function palAt(tx){ let p=PAL[0]; for (const q of PAL) if (tx>=q.x) p=q; return p; }
+function bgAt(tx){
+  let i=0; while (i<PAL.length-1 && tx>=PAL[i+1].x) i++;
+  const a=PAL[i], b=PAL[Math.min(i+1,PAL.length-1)];
+  const t = a===b ? 0 : clamp((tx-(b.x-6))/6,0,1);
+  return { top:lerpColor(a.top,b.top,t), bot:lerpColor(a.bot,b.bot,t), l:a.l.map((c,k)=>lerpColor(c,b.l[k],t)) };
+}
+function buildTileCanvas(){
+  tileCanvas = document.createElement('canvas'); tileCanvas.width=MW*T; tileCanvas.height=MH*T;
+  const c = tileCanvas.getContext('2d');
+  for (let ty=0;ty<MH;ty++) for (let tx=0;tx<MW;tx++){
+    if (map[ty][tx]!=='#') continue;
+    const p=palAt(tx), x=tx*T, y=ty*T, open=(a,b)=>{ const t=(a<0||b<0||a>=MW||b>=MH)?'#':map[b][a]; return t!=='#'&&t!=='C'; };
+    c.fillStyle=p.base; c.fillRect(x,y,T,T);
+    for (let i=0;i<3;i++){ const h=hash(tx*3+i,ty); c.fillStyle=`rgba(0,0,0,${0.12+h*0.15})`; c.fillRect(x+hash(tx,ty*5+i)*26,y+hash(tx*7+i,ty)*26,4+h*6,3+h*4); }
+    if (open(tx,ty-1)){ c.fillStyle=p.moss; c.fillRect(x,y,T,5); for (let i=0;i<4;i++){ const gx=x+hash(tx,ty+i)*30; c.fillRect(gx,y-3-hash(tx+i,ty)*4,2,4); } }
+    if (open(tx,ty+1)){ c.fillStyle='rgba(0,0,0,0.35)'; c.fillRect(x,y+T-4,T,4); }
+    if (open(tx-1,ty)){ c.fillStyle='rgba(255,255,255,0.05)'; c.fillRect(x,y,3,T); }
+    if (open(tx+1,ty)){ c.fillStyle='rgba(0,0,0,0.25)'; c.fillRect(x+T-3,y,3,T); }
+  }
+}
+function drawBackground(){
+  const pal=bgAt((camX+VW/2)/T);
+  const g=ctx.createLinearGradient(0,0,0,VH); g.addColorStop(0,pal.top); g.addColorStop(1,pal.bot);
+  ctx.fillStyle=g; ctx.fillRect(0,0,VW,VH);
+  [0.12,0.25,0.45].forEach((f,k)=>{
+    ctx.fillStyle=pal.l[k]; ctx.beginPath(); ctx.moveTo(0,VH);
+    for (let x=0;x<=VW;x+=16){ const wx=x+camX*f; const h=150+k*55+Math.sin(wx*0.004+k)*40+Math.sin(wx*0.011+k*2)*18; ctx.lineTo(x, VH-h+(camY*f*0.25-60*f)); }
+    ctx.lineTo(VW,VH); ctx.fill();
+  });
+  for (let i=0;i<16;i++){          // 悬垂的根须
+    const span=VW+300, x=((i*173-camX*0.55)%span+span)%span-150, len=60+hash(i,3)*140;
+    ctx.strokeStyle='rgba(0,0,0,0.25)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(x,0);
+    ctx.quadraticCurveTo(x+Math.sin(animT+i)*8,len/2,x+4,len); ctx.stroke();
+  }
+  for (let i=0;i<40;i++){          // 浮游的孢子
+    const span=VW+40, x=((hash(i,1)*span - camX*0.7 + Math.sin(animT*0.5+i)*20)%span+span)%span-20;
+    const y=((hash(i,2)*VH - animT*(8+hash(i,4)*12) - camY*0.7)%VH+VH)%VH;
+    ctx.fillStyle=`rgba(220,240,210,${0.15+hash(i,5)*0.25})`; ctx.fillRect(x,y,2,2);
+  }
+}
+function drawTiles(){
+  const sx=Math.max(0,Math.floor(camX)), sy=Math.max(0,Math.floor(camY));
+  ctx.drawImage(tileCanvas, sx, sy, VW+2, VH+2, sx, sy, VW+2, VH+2);
+  const x0=Math.floor(camX/T), x1=Math.floor((camX+VW)/T), y0=Math.floor(camY/T), y1=Math.floor((camY+VH)/T);
+  for (let ty=y0;ty<=y1;ty++) for (let tx=x0;tx<=x1;tx++){
+    if (ty<0||ty>=MH||tx<0||tx>=MW) continue;
+    const c=map[ty][tx], x=tx*T, y=ty*T;
+    if (updraft[ty][tx]){
+      ctx.fillStyle='rgba(230,240,245,0.05)'; ctx.fillRect(x,y,T,T);
+      const k=(animT*90+hash(tx,0)*T)%T; ctx.fillStyle='rgba(235,245,250,0.18)'; ctx.fillRect(x+hash(tx,ty)*28, y+T-k, 2, 10);
+    }
+    if (c==='='){ ctx.fillStyle='#6b4a2b'; ctx.fillRect(x,y,T,8); ctx.fillStyle='#8a6440'; ctx.fillRect(x,y,T,3); ctx.fillStyle='#3b2816'; ctx.fillRect(x+3,y+3,2,2); ctx.fillRect(x+T-5,y+3,2,2); }
+    else if (c==='^'){
+      ctx.fillStyle='#cfc6b8';
+      for (let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(x+i*11,y+T); ctx.lineTo(x+i*11+5.5,y+T*0.42); ctx.lineTo(x+i*11+11,y+T); ctx.fill(); }
+      ctx.fillStyle='rgba(120,30,40,0.5)'; ctx.fillRect(x,y+T-4,T,4);
+    }
+    else if (c==='C'){
+      ctx.fillStyle='#3a3f47'; ctx.fillRect(x,y,T,T); ctx.strokeStyle='#15181c'; ctx.lineWidth=2; ctx.beginPath();
+      ctx.moveTo(x+4,y+6); ctx.lineTo(x+14,y+15); ctx.lineTo(x+10,y+26); ctx.moveTo(x+14,y+15); ctx.lineTo(x+27,y+12); ctx.stroke();
+      ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.strokeRect(x+1,y+1,T-2,T-2);
+    }
+    else if (c==='F'){
+      const s=fragile.get(ty*MW+tx); if (s && s.gone) continue;
+      const creak = bridgeStress>0 && Math.abs(tx*T+T/2-(P.x+P.w/2))<4*T;
+      const j = creak ? (Math.random()-0.5)*3 : 0;
+      ctx.fillStyle = creak ? '#7a4f33' : '#8a6a42';
+      for (let i=0;i<3;i++) ctx.fillRect(x+i*11+1+j, y+1, 9, 9);
+      ctx.fillStyle='#4a3420'; ctx.fillRect(x, y+10, T, 2);
+    }
+  }
+}
+function drawSpring(s){
+  const col=FILLINGS[s.fill].color, x=s.x, y=s.y;
+  ctx.fillStyle='#38454a'; ctx.beginPath(); ctx.moveTo(x-22,y-18); ctx.lineTo(x+22,y-18); ctx.lineTo(x+15,y); ctx.lineTo(x-15,y); ctx.fill();
+  ctx.fillStyle='#56676d'; ctx.fillRect(x-25,y-22,50,5);
+  ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(x,y-20,19,3.5,0,0,Math.PI*2); ctx.fill();
+  for (let i=0;i<3;i++){ const t=(animT*1.2+i/3)%1; ctx.globalAlpha=1-t; ctx.beginPath(); ctx.arc(x+(i-1)*7, y-22-30*Math.sin(t*Math.PI), 2.5, 0, Math.PI*2); ctx.fill(); }
+  ctx.globalAlpha=1;
+  if (s.fill==='steam'){ ctx.fillStyle='rgba(235,242,245,0.25)'; for (let i=0;i<3;i++){ const t=(animT*0.6+i/3)%1; ctx.beginPath(); ctx.arc(x+Math.sin(t*6+i)*6, y-24-t*50, 6+t*8, 0, Math.PI*2); ctx.fill(); } }
+  ctx.font=`12px ${FONT}`; ctx.textAlign='center'; ctx.fillStyle='rgba(230,236,230,0.75)'; ctx.fillText(FILLINGS[s.fill].name+'泉', x, y-46);
+}
+function drawBench(b){
+  const x=b.x, y=b.y, near=Math.abs(P.x+P.w/2-x)<40 && Math.abs(P.y+P.h-y)<40;
+  if (near){ const g=ctx.createRadialGradient(x,y-20,4,x,y-20,60); g.addColorStop(0,'rgba(255,220,150,0.35)'); g.addColorStop(1,'rgba(255,220,150,0)'); ctx.fillStyle=g; ctx.fillRect(x-60,y-80,120,90); }
+  ctx.fillStyle='#5b3d22'; ctx.fillRect(x-28,y-16,56,6); ctx.fillRect(x-24,y-10,5,10); ctx.fillRect(x+19,y-10,5,10);
+  ctx.fillStyle='#e8ecea'; ctx.fillRect(x-16,y-23,8,7); ctx.fillRect(x+9,y-23,8,7);
+  ctx.beginPath(); ctx.ellipse(x,y-21,7,5,0,0,Math.PI*2); ctx.fill(); ctx.fillRect(x+5,y-24,6,2);
+  ctx.fillStyle='#3b6ea8'; ctx.fillRect(x-16,y-20,8,1.5); ctx.fillRect(x+9,y-20,8,1.5);
+}
+function drawSign(s){
+  ctx.fillStyle='#4a3824'; ctx.fillRect(s.x-2,s.y-30,4,30);
+  ctx.fillStyle='#7a5a36'; ctx.fillRect(s.x-15,s.y-44,30,18);
+  ctx.fillStyle='#3a2a18'; ctx.fillRect(s.x-10,s.y-39,20,2); ctx.fillRect(s.x-10,s.y-34,14,2);
+}
+function drawSignBubble(s){
+  const lines=s.text.split('\n'); ctx.font=`14px ${FONT}`;
+  const w=Math.max(...lines.map(l=>ctx.measureText(l).width))+28, h=lines.length*21+16;
+  const x=clamp(s.x-camX-w/2,8,VW-w-8), y=s.y-camY-54-h;
+  ctx.fillStyle='rgba(12,16,18,0.88)'; rr(x,y,w,h,8); ctx.fill(); ctx.strokeStyle='rgba(220,200,150,0.5)'; ctx.stroke();
+  ctx.fillStyle='#efe9dc'; ctx.textAlign='left'; lines.forEach((l,i)=>ctx.fillText(l,x+14,y+24+i*21));
+}
+function drawGoal(){
+  const x=goal.x, y=goal.y-14+Math.sin(animT*2)*4;
+  const g=ctx.createRadialGradient(x,y-10,4,x,y-10,90); g.addColorStop(0,'rgba(255,215,110,0.55)'); g.addColorStop(1,'rgba(255,215,110,0)');
+  ctx.fillStyle=g; ctx.fillRect(x-90,y-100,180,180);
+  ctx.fillStyle='#f2c14e'; ctx.beginPath(); ctx.moveTo(x-16,y-22); ctx.lineTo(x+16,y-22); ctx.quadraticCurveTo(x+14,y-2,x,y); ctx.quadraticCurveTo(x-14,y-2,x-16,y-22); ctx.fill();
+  ctx.fillRect(x-2,y,4,8); ctx.fillRect(x-9,y+8,18,4);
+  ctx.fillStyle='#fff3c4'; ctx.fillRect(x-12,y-20,24,3);
+  for (let i=0;i<5;i++){ const a=animT*1.5+i*1.26; ctx.fillStyle='rgba(255,240,190,0.8)'; ctx.fillRect(x+Math.cos(a)*30,y-10+Math.sin(a)*18,2,2); }
+}
+function drawLeaf(l){
+  ctx.save(); ctx.translate(l.x,l.y); ctx.rotate(Math.sin(animT*3+l.x)*0.5);
+  ctx.fillStyle='#7ccf6a'; ctx.beginPath(); ctx.ellipse(0,0,7,3.5,0,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#3f7a35'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(-6,0); ctx.lineTo(6,0); ctx.stroke(); ctx.restore();
+}
+function drawEnemy(e){
+  const cx=e.x+e.w/2, by=e.y+e.h;
+  if (e.kind==='crawler'){
+    const leg=Math.sin(animT*14+e.x)*2;
+    ctx.strokeStyle='#1f3a28'; ctx.lineWidth=2;
+    for (let i=-1;i<=1;i++){ ctx.beginPath(); ctx.moveTo(cx+i*8,by-5); ctx.lineTo(cx+i*9+leg*(i%2?1:-1),by); ctx.stroke(); }
+    ctx.fillStyle=e.flash>0?'#ffffff':'#2f5d3e'; ctx.beginPath(); ctx.ellipse(cx,by-8,16,12,0,Math.PI,0); ctx.fill();
+    ctx.fillStyle=e.flash>0?'#ffffff':'#4f8a5f'; for (let i=-1;i<=1;i++){ ctx.beginPath(); ctx.arc(cx+i*7,by-14,3.5,0,Math.PI*2); ctx.fill(); }
+    ctx.fillStyle='#f0f0e0'; const fx=cx+e.dir*10; ctx.fillRect(fx-2,by-11,3,3); ctx.fillRect(fx+3*e.dir-1,by-11,3,3);
+  } else {
+    const flap=Math.sin(animT*30+e.t)*5;
+    ctx.fillStyle='rgba(220,230,240,0.45)';
+    ctx.beginPath(); ctx.ellipse(cx-11,e.y+4-flap,9,4,-0.4,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(cx+11,e.y+4-flap,9,4,0.4,0,Math.PI*2); ctx.fill();
+    const g=ctx.createRadialGradient(cx,e.y+12,2,cx,e.y+12,26); g.addColorStop(0,'rgba(255,190,90,0.45)'); g.addColorStop(1,'rgba(255,190,90,0)');
+    ctx.fillStyle=g; ctx.fillRect(cx-26,e.y-14,52,52);
+    ctx.fillStyle=e.flash>0?'#ffffff':'#ff9f43'; ctx.beginPath(); ctx.arc(cx,e.y+12,10,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#2a1a0a'; ctx.fillRect(cx-5,e.y+9,3,4); ctx.fillRect(cx+2,e.y+9,3,4);
+  }
+  if (e.slow>0){ ctx.fillStyle='rgba(242,169,30,0.55)'; ctx.fillRect(e.x+4,by-4,e.w-8,3); ctx.fillRect(e.x+8+Math.sin(animT*4)*4,by-2,3,5); }
+}
+function drawTeapotHead(type, level){
+  const col=FILLINGS[type].color;
+  ctx.strokeStyle='#dfe6e8'; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(-16,-33,7,Math.PI*0.5,Math.PI*1.5); ctx.stroke();
+  ctx.fillStyle='#e9eef0'; ctx.beginPath(); ctx.moveTo(10,-29); ctx.lineTo(24,-42); ctx.lineTo(28,-40); ctx.lineTo(14,-23); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#eef3f4'; ctx.beginPath(); ctx.ellipse(0,-33,16,13,0,0,Math.PI*2); ctx.fill();
+  ctx.save(); ctx.beginPath(); ctx.ellipse(1,-26,11,5.5,0,0,Math.PI*2); ctx.clip();
+  ctx.fillStyle='#1c2430'; ctx.fillRect(-12,-32,26,12);
+  const lh=11*level/100; ctx.fillStyle=col; ctx.fillRect(-12,-20.5-lh,26,lh+1);
+  ctx.fillStyle='rgba(255,255,255,0.35)'; ctx.fillRect(-12,-20.5-lh,26,1.2);
+  ctx.restore();
+  ctx.strokeStyle='#3b6ea8'; ctx.lineWidth=1.4; ctx.beginPath(); ctx.ellipse(1,-26,11.5,6,0,0,Math.PI*2); ctx.stroke();
+  ctx.fillStyle='#e3eaec'; ctx.beginPath(); ctx.ellipse(0,-46,9,3,0,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(0,-50,3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#111'; ctx.beginPath(); ctx.ellipse(3,-37,2.6,3.6,0,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.ellipse(10,-37,2.6,3.6,0,0,Math.PI*2); ctx.fill();
+}
+function drawPlayer(){
+  if (P.dying>0) return;
+  ctx.save();
+  if (P.inv>0 && Math.floor(P.inv*16)%2===0) ctx.globalAlpha=0.45;
+  ctx.translate(Math.round(P.x+P.w/2), Math.round(P.y+P.h));
+  const st = P.onGround ? 0 : clamp(Math.abs(P.vy)/2600,0,0.14);
+  ctx.scale(P.face*(1-st*0.6), 1+st);
+  const walk = P.onGround && Math.abs(P.vx)>20 ? Math.sin(animT*16) : 0;
+  ctx.fillStyle='#161b26'; ctx.fillRect(-7,-9+walk*1.5,5,9-walk*1.5); ctx.fillRect(2,-9-walk*1.5,5,9+walk*1.5);
+  ctx.fillStyle='#232a3d'; ctx.beginPath(); ctx.moveTo(-10,-23); ctx.lineTo(10,-23); ctx.lineTo(13,-7);
+  ctx.quadraticCurveTo(0,-3,-14-Math.abs(P.vx)/60,-7+Math.sin(animT*8)*1.5); ctx.closePath(); ctx.fill();
+  drawTeapotHead(P.teapot.type, P.teapot.level);
+  ctx.restore();
+  if (P.attackT>0){
+    const a=P.attackT/0.2, col=fdef().color, cx=P.x+P.w/2, cy=P.y+P.h/2;
+    ctx.strokeStyle=col; ctx.globalAlpha=a; ctx.lineWidth=6; ctx.beginPath();
+    if (P.attackDir==='side') ctx.arc(cx+P.face*16, cy-4, 34, P.face>0?-1.1:Math.PI-1.1+0.0, P.face>0?1.1:Math.PI+1.1);
+    else if (P.attackDir==='up') ctx.arc(cx, cy-22, 32, Math.PI+0.4, -0.4);
+    else ctx.arc(cx, cy+24, 32, 0.4, Math.PI-0.4);
+    ctx.stroke(); ctx.globalAlpha=1;
+  }
+}
+function drawProjectiles(){
+  for (const p of projectiles){
+    ctx.globalAlpha = p.effect==='push' ? clamp(p.life/p.max,0,1)*0.6 : 1;
+    ctx.fillStyle=p.col; ctx.beginPath(); ctx.arc(p.x,p.y,p.size,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+}
+function drawParticles(){
+  for (const p of particles){ ctx.globalAlpha=clamp(p.life/p.max,0,1); ctx.fillStyle=p.col; ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size); }
+  ctx.globalAlpha=1;
+}
+function drawCup(x,y,full){
+  ctx.fillStyle = full ? '#eef3f4' : 'rgba(238,243,244,0.15)';
+  ctx.beginPath(); ctx.moveTo(x-10,y-8); ctx.lineTo(x+10,y-8); ctx.quadraticCurveTo(x+9,y+7,x,y+8); ctx.quadraticCurveTo(x-9,y+7,x-10,y-8); ctx.fill();
+  ctx.strokeStyle = full ? '#eef3f4' : 'rgba(238,243,244,0.25)'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x+11,y-2,4,-1.2,1.2); ctx.stroke();
+  if (full){ ctx.fillStyle='#3b6ea8'; ctx.fillRect(x-9,y-5,18,2); }
+}
+function drawHUD(){
+  for (let i=0;i<PLAYER_HP;i++) drawCup(28+i*30, 28, i<P.hp);
+  const def=fdef(), W=totalWeight(), ag=agility(), x=16, y=50, slotW=40, panelW=Math.max(250, P.slots.length*(slotW+6)+24);
+  ctx.fillStyle='rgba(0,0,0,0.42)'; rr(x-4,y-6,panelW,118,8); ctx.fill();
+  ctx.font=`13px ${FONT}`; ctx.textAlign='left'; ctx.fillStyle='#e8efe8';
+  ctx.fillText(`茶壶：${def.name}  ${Math.round(P.teapot.level)}%`, x+6, y+12);
+  ctx.fillStyle='rgba(255,255,255,0.1)'; rr(x+6,y+18,170,9,4); ctx.fill();
+  ctx.fillStyle=def.color; rr(x+6,y+18,Math.max(0.01,170*P.teapot.level/100),9,4); ctx.fill();
+  ctx.fillStyle='#b8c8c0'; ctx.fillText(`能力：${def.ability?ABILITY_NAME[def.ability]:'无'}`, x+184, y+27);
+  P.slots.forEach((s,i)=>{
+    const sx=x+6+i*(slotW+6), sy=y+36;
+    ctx.fillStyle='rgba(255,255,255,0.06)'; rr(sx,sy,slotW,40,6); ctx.fill();
+    ctx.strokeStyle = i===P.sel ? '#f2c14e' : 'rgba(255,255,255,0.2)'; ctx.lineWidth = i===P.sel?2:1; rr(sx,sy,slotW,40,6); ctx.stroke();
+    if (s){
+      ctx.fillStyle='rgba(220,235,240,0.25)'; rr(sx+12,sy+8,16,26,5); ctx.fill(); ctx.fillRect(sx+16,sy+4,8,5);
+      const h=24*s.level/100; ctx.fillStyle=FILLINGS[s.type].color; rr(sx+13,sy+33-h,14,h,4); ctx.fill();
+    }
+    ctx.fillStyle='rgba(230,236,230,0.6)'; ctx.font=`10px ${FONT}`; ctx.fillText(String(i+1), sx+3, sy+12);
+  });
+  ctx.font=`13px ${FONT}`;
+  const heavy = W>WEIGHT.fragileLimit;
+  ctx.fillStyle = heavy ? '#ffb38a' : '#cfe3d6';
+  ctx.fillText(`总重 ${W.toFixed(1)}　灵活 ${Math.round(ag*100)}%${heavy?'　（超过脆木桥承重 '+WEIGHT.fragileLimit+'）':''}`, x+6, y+96);
+  ctx.textAlign='right'; ctx.fillStyle='#9fe08f'; ctx.font=`16px ${FONT}`; ctx.fillText(`🍃 ${P.leaves}`, VW-18, 32);
+  ctx.fillStyle='rgba(230,236,230,0.5)'; ctx.font=`12px ${FONT}`; ctx.fillText(`${fmtTime(playTime)}　B 背包与说明`, VW-18, 52);
+  // 交互提示
+  const near=nearInteractable(); let tip='';
+  if (near && near.kind==='spring') tip=`E 把${FILLINGS[near.o.fill].name}灌进茶壶　C 装一瓶进背包`;
+  if (near && near.kind==='bench') tip=`E 休息（恢复生命、设为复活点）　U 扩充背包（${BACKPACK.upgradeCost} 茶叶）`;
+  if (tip){ ctx.font=`15px ${FONT}`; ctx.textAlign='center'; const w=ctx.measureText(tip).width+30;
+    ctx.fillStyle='rgba(10,14,16,0.8)'; rr(VW/2-w/2,VH-50,w,32,8); ctx.fill(); ctx.fillStyle='#f2e6c8'; ctx.fillText(tip,VW/2,VH-29); }
+  toasts.forEach((t,i)=>{ ctx.globalAlpha=clamp(t.t,0,1); ctx.font=`15px ${FONT}`; ctx.textAlign='center'; const w=ctx.measureText(t.text).width+28;
+    ctx.fillStyle='rgba(10,14,16,0.82)'; rr(VW/2-w/2,16+i*36,w,30,8); ctx.fill(); ctx.fillStyle='#f4efe2'; ctx.fillText(t.text,VW/2,36+i*36); });
+  ctx.globalAlpha=1;
+}
+function fmtTime(s){ const m=Math.floor(s/60), r=Math.floor(s%60); return `${m}:${String(r).padStart(2,'0')}`; }
+function overlayPanel(alpha){ ctx.fillStyle=`rgba(4,8,10,${alpha})`; ctx.fillRect(0,0,VW,VH); }
+function drawTitle(){
+  overlayPanel(0.72);
+  ctx.save(); ctx.translate(VW/2, 250); ctx.scale(3.2,3.2); drawTeapotHead('water', 70+Math.sin(animT*2)*10); ctx.restore();
+  ctx.textAlign='center'; ctx.fillStyle='#f2e6c8'; ctx.font=`bold 54px ${FONT}`; ctx.fillText('壶 中 天 地', VW/2, 330);
+  ctx.font=`16px ${FONT}`; ctx.fillStyle='#b8c8c0'; ctx.fillText('Teapot Knight · 网页原型', VW/2, 362);
+  ctx.fillStyle='#e8efe8'; ctx.font=`15px ${FONT}`;
+  ['茶壶里装的东西决定你的能力，背包里带的瓶子决定你有多灵活。', '←/→ 移动　空格 跳跃　J 攻击　L 冲刺　I 喷射　E 泉眼/茶台　B 说明']
+    .forEach((l,i)=>ctx.fillText(l, VW/2, 410+i*28));
+  ctx.fillStyle = Math.floor(animT*2)%2 ? '#f2c14e' : '#c9a23e'; ctx.font=`18px ${FONT}`; ctx.fillText('按 Enter 开始', VW/2, 490);
+}
+function drawPause(){
+  overlayPanel(0.82);
+  ctx.textAlign='left'; ctx.fillStyle='#f2e6c8'; ctx.font=`bold 24px ${FONT}`; ctx.fillText('背包与填充物', 50, 56);
+  let y=96;
+  for (const [k,f] of Object.entries(FILLINGS)){
+    if (k==='none') continue;
+    ctx.fillStyle=f.color; rr(50,y-14,18,18,4); ctx.fill();
+    ctx.fillStyle='#f4efe2'; ctx.font=`bold 16px ${FONT}`; ctx.fillText(`${f.name}　重量 ${f.weight}　近战 ${f.dmg}${f.melee==='push'?'（击退）':f.melee==='slow'?'（减速）':''}`, 78, y);
+    ctx.fillStyle='#c4d2ca'; ctx.font=`14px ${FONT}`; ctx.fillText(f.abilityDesc, 78, y+22);
+    if (f.shot) ctx.fillText(`喷射「${f.shot.name}」：伤害 ${f.shot.dmg}，消耗 ${f.shot.cost}${f.shot.effect==='break'?'，能打碎裂纹石块':f.shot.effect==='slow'?'，命中减速':f.shot.effect==='push'?'，强力击退':''}`, 78, y+42);
+    y+=74;
+  }
+  const W=totalWeight();
+  ctx.fillStyle='#f2c14e'; ctx.font=`15px ${FONT}`;
+  ctx.fillText(`当前总重 ${W.toFixed(2)}　→　跑速 ×${speedMul().toFixed(2)}　跳跃 ×${jumpMul().toFixed(2)}　（脆木桥承重 ${WEIGHT.fragileLimit}）`, 50, y+6);
+  ctx.fillStyle='#e8efe8'; ctx.font=`14px ${FONT}`;
+  ['←/→ 移动　空格/K 跳跃（↓+跳跃 穿过木台）　J 攻击（↑/↓ 改变方向，向下攻击可踩敌人弹起）　L/Shift 冲刺　I/F 喷射',
+   'E 泉眼灌壶 / 茶台休息　C 装瓶进背包　1–5 与背包互换　Q 选择格子　X 倒掉选中的瓶子　U 在茶台扩充背包',
+   'B/Esc 返回游戏　R 重新开始　M 静音']
+    .forEach((l,i)=>ctx.fillText(l, 50, y+40+i*24));
+}
+function drawWin(){
+  overlayPanel(0.78);
+  ctx.textAlign='center'; ctx.fillStyle='#f2c14e'; ctx.font=`bold 44px ${FONT}`; ctx.fillText('你找到了金茶盏！', VW/2, 200);
+  ctx.fillStyle='#f4efe2'; ctx.font=`18px ${FONT}`;
+  ctx.fillText(`用时 ${fmtTime(playTime)}　·　倒下 ${P.deaths} 次　·　茶叶 ${P.leaves} 片`, VW/2, 260);
+  ctx.fillStyle='#b8c8c0'; ctx.font=`15px ${FONT}`; ctx.fillText('这只是原型的第一段旅程。按 R 再来一次', VW/2, 320);
+}
+function render(){
+  ctx.save();
+  drawBackground();
+  const sx = shakeT>0 ? (Math.random()-0.5)*8*shakeAmp : 0, sy = shakeT>0 ? (Math.random()-0.5)*8*shakeAmp : 0;
+  ctx.translate(-Math.round(camX)+sx, -Math.round(camY)+sy);
+  drawTiles();
+  springs.forEach(drawSpring); benches.forEach(drawBench); signs.forEach(drawSign);
+  if (goal) drawGoal();
+  leaves.forEach(l=>{ if (!l.taken) drawLeaf(l); });
+  enemies.forEach(e=>{ if (e.alive) drawEnemy(e); });
+  drawPlayer(); drawProjectiles(); drawParticles();
+  ctx.restore();
+  const vg=ctx.createRadialGradient(VW/2,VH/2,VH*0.35,VW/2,VH/2,VH*0.95); vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(0,0,0,0.55)');
+  ctx.fillStyle=vg; ctx.fillRect(0,0,VW,VH);
+  if (state!=='title'){
+    for (const s of signs) if (Math.abs(s.x-(P.x+P.w/2))<56 && Math.abs(s.y-(P.y+P.h))<48) drawSignBubble(s);
+    drawHUD();
+  }
+  if (P.fade>0 || P.dying>0){ ctx.fillStyle=`rgba(0,0,0,${P.dying>0?clamp(1-P.dying/1.3,0,1):clamp(P.fade/0.35,0,1)})`; ctx.fillRect(0,0,VW,VH); }
+  if (state==='title') drawTitle();
+  if (state==='pause') drawPause();
+  if (state==='win') drawWin();
+}
+
+/* ============================== 主循环 ============================== */
+let last=performance.now(), acc=0;
+function frame(t){
+  const dt=Math.min(0.05,(t-last)/1000); last=t;
+  if (state==='play'){ acc+=dt; let n=0; while (acc>=STEP){ update(STEP); acc-=STEP; n++; } if (n) pressed.clear(); }
+  else { acc=0; animT+=dt; pressed.clear(); }
+  render(); requestAnimationFrame(frame);
+}
+function fit(){ const s=Math.min(innerWidth/VW, innerHeight/VH); cvs.style.width=VW*s+'px'; cvs.style.height=VH*s+'px'; }
+addEventListener('resize', fit); fit();
+newGame();
+requestAnimationFrame(frame);
+
+// 调试接口（自动化测试用）
+window.TK = { P, held, pressed, update, STEP, T, map, tile, newGame,
+  get state(){ return state; }, set state(v){ state=v; }, get enemies(){ return enemies; },
+  setFill(type,level=100){ P.teapot={ type, level }; },
+  tp(tx,floor){ P.x=tx*T+5; P.y=floor*T-P.h; P.vx=P.vy=0; P.safe={ x:P.x, y:P.y }; camX=clamp(P.x-VW/2,0,MW*T-VW); camY=clamp(P.y-VH/2,0,MH*T-VH); },
+  step(sec){ for (let i=0;i<Math.round(sec/STEP);i++) update(STEP); },
+};
+</script>
+</body>
+</html>
